@@ -7,11 +7,14 @@ from __future__ import annotations
 import gzip
 from pathlib import Path
 
+import numpy as np
+
 from .train import Row
 
 
-def load(path: str | Path) -> tuple[int, list[Row]]:
-    """(scheme, rows) of a base file (.tsv or .tsv.gz)."""
+def load(path: str | Path, arrays: bool = False) -> tuple[int, list[Row]]:
+    """(scheme, rows) of a base file (.tsv or .tsv.gz). arrays = each row's features as a numpy array (scheme 2's base
+    is 4 million numbers: as Python floats it would take ~130 MB)."""
     p = Path(path)
     opener = gzip.open if p.suffix == ".gz" else open
     scheme = 0
@@ -29,6 +32,7 @@ def load(path: str | Path) -> tuple[int, list[Row]]:
             c = line.split("\t")
             if len(c) < 7:
                 continue
+            x = [float(t) for t in c[6].split(" ") if t]
             rows.append(Row(check=c[0], pack=c[1], label=c[2] == "1", source=c[3], path=c[4], fold=int(c[5]),
-                            x=[float(t) for t in c[6].split(" ") if t]))
+                            x=np.array(x) if arrays else x))
     return scheme, rows

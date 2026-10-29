@@ -23,6 +23,7 @@ import numpy as np
 from .train import NEVER
 
 LADDER = [0.9, 0.95, 0.97, 0.98, 0.99, 0.995, 0.998, 0.999, 0.9995, 0.9999]
+WRONG = 0.003  # a check is "sure" where at most this share of what it decides (packs it never heard) is wrong
 PARAMS = dict(max_iter=150, learning_rate=0.1, max_leaf_nodes=15, min_samples_leaf=20, l2_regularization=1.0,
               early_stopping=False, random_state=1)
 
@@ -135,7 +136,7 @@ def bar(p: np.ndarray, y: np.ndarray) -> tuple[float, int, int]:
         dec = (p >= th) | (p <= 1 - th)
         d = int(dec.sum())
         w = int(((p[dec] >= th) != y[dec]).sum())
-        if d >= 20 and w <= 0.003 * d:
+        if d >= 20 and w <= WRONG * d:
             return th, d, w
     return NEVER, 0, 0
 
@@ -154,3 +155,93 @@ def train_and_test(name: str, x: np.ndarray, y: np.ndarray, fold: np.ndarray) ->
     final = read(fit(name, x, y).to_text())[name]
     final.sure = bar(held[has], y[has])[0]
     return final, held
+
+
+# ---------------------------------------------------------------- scheme 2: the whole model
+
+FP, HINT = 64, 8          # a scheme 2 row's features: the check's own ++ the fingerprint (FP) ++ the name hint (HINT)
+# the checks that stop a name (Sorter.cs: a played note or a drum hit, one hit or a loop) hear the sound alone: with
+# the name in them, a name could overrule its own check ("Kick 03 - Break My Heart" heard as a drum loop: research,
+# 2026-10-29); the ones that choose between kinds (loopkind, the pairs) hear the name hint too
+SOUND_ALONE = ("note", "loop")
+# the decision's bars for trees (the app's Sorter defaults, tuned for logistic checks, stop sounds that trees are sure
+# of: swept with the real decision on held-out pack groups, none raised the wrong moves; HANDOVER 1zq)
+BARS = "bars LoopSure=0.9 OneShotSure=0.1 NoteVetoExplicit=0.97 NoteVetoFolder=0.5 DrumVetoExplicit=0.001 DrumVetoFolder=0.03 LoopKindWithPack=0.75 LoopKindVeto=0.995"
+
+
+def features(name: str, x: np.ndarray) -> np.ndarray:
+    """What a check hears of its rows (own ++ fingerprint ++ hint): the sound-alone ones without the hint."""
+    return x[:, : x.shape[1] - HINT] if name in SOUND_ALONE else x
+
+
+def train_model(rows: list, about: str, report: list[str], bars: str = BARS) -> tuple[str, dict[str, TreeCheck], dict]:
+    """
+    Every check of scheme 2 (in the order the rows name them first) from rows whose x = own ++ fingerprint ++ hint
+    (missing = NaN). Packs held out in 8 groups by their hash set each check's bar; then each is trained on everything.
+    Also each check's held-out score on the base rows only (source not "shared": the gate never takes answers as the
+    truth): {check: {"rows", "bar", "decided", "wrong"}}.
+    """
+    from .train import folds_of
+
+    by: dict[str, list] = {}
+    for r in rows:
+        by.setdefault(r.check, []).append(r)
+    report.append("== the checks (trees): packs held out in 8 groups; decided by itself / wrong, on the base's rows")
+    text = [f"# {about}\n", bars + "\n"]
+    checks: dict[str, TreeCheck] = {}
+    heldout: dict[str, dict] = {}
+    for name, ex in by.items():
+        y = np.array([r.label for r in ex], dtype=bool)
+        if len(ex) < 40 or y.all() or not y.any():
+            report.append(f"   {name}: too few examples ({len(ex)})")
+            continue
+        x = features(name, np.array([r.x for r in ex], dtype=float))
+        c, held = train_and_test(name, x, y, folds_of(ex))
+        base = np.array([r.source != "shared" for r in ex]) & ~np.isnan(held)
+        p, t = held[base], y[base]
+        dec = (p >= c.sure) | (p <= 1 - c.sure) if c.sure <= 1 else np.zeros(len(p), dtype=bool)
+        decided, wrong = int(dec.sum()), int(((p[dec] >= c.sure) != t[dec]).sum())
+        heldout[name] = {"rows": int(base.sum()), "bar": c.sure, "decided": decided, "wrong": wrong}
+        report.append(f"   {name:<22} {int(y.sum()):5} yes / {int((~y).sum()):5} no ({len(ex) - int(base.sum())} shared) | "
+                      f"bar {'never' if c.sure > 1 else f'{c.sure:g}'} | base held out: {decided} decided, {wrong} wrong")
+        # the surest "mistakes" on the base: often the base's own label is what's wrong (worth a look: the golden truth)
+        idx = np.where(base)[0]
+        miss = sorted((i for i in idx if (held[i] >= 0.5) != y[i]), key=lambda i: -abs(held[i] - 0.5))
+        for i in miss[:8]:
+            report.append(f"        sure but wrong: P {held[i]:.4f} labelled {'yes' if ex[i].label else 'no'} ({ex[i].source}) {ex[i].path}")
+        checks[name] = c
+        text.append(c.to_text())
+    return "".join(text), checks, heldout
+
+
+@dataclass
+class Gate:
+    passed: bool
+    checks: dict[str, dict] = field(default_factory=dict)
+    why: list[str] = field(default_factory=list)
+
+
+def gate(candidate: dict[str, dict], current: dict[str, dict]) -> Gate:
+    """
+    May the candidate replace the model in use? Both scored on the base's examples held out the same way (the same
+    packs in the same 8 groups: train_model's held-out score; the answers never count as the truth here). Only if every
+    check the current one has is there; none decides more of them wrongly by itself unless it stays within the rule
+    that makes a check "sure" at all (at most 0.3% of what it decides: one more wrong of 1,400 is chance, and a gate
+    that counts it would keep every new model out); and none gives up deciding (under half as many decided: bad
+    answers, or too few yet).
+    """
+    g = Gate(passed=True)
+    for name in sorted(set(current) | set(candidate)):
+        now, new = current.get(name), candidate.get(name)
+        g.checks[name] = {"current": now, "candidate": new}
+        if now is not None and new is None:
+            g.passed = False
+            g.why.append(f"{name}: missing (too few examples?)")
+        elif now is not None and new["wrong"] > now["wrong"] and new["wrong"] > WRONG * new["decided"]:
+            g.passed = False
+            g.why.append(f"{name}: {new['wrong']} of {new['decided']} decided wrongly on the base held out (now {now['wrong']} of {now['decided']}; "
+                         f"more than {WRONG:.1%})")
+        elif now is not None and now["decided"] > 0 and new["decided"] * 2 < now["decided"]:
+            g.passed = False
+            g.why.append(f"{name}: decides {new['decided']} by itself (now {now['decided']}): much less")
+    return g

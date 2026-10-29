@@ -5,3 +5,8 @@ uvicorn[standard]==0.54.0
 psycopg[binary]==3.3.6
 cryptography==50.0.2
 numpy==2.5.4
+# scheme 2's trees (app/trees.py): the very versions the app's built-in model was trained with (tools/builtin.py)
+scikit-learn==1.9.1
+scipy==1.18.1
+joblib==1.6.0
+threadpoolctl==3.7.0

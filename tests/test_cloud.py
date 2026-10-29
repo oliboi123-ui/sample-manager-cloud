@@ -16,11 +16,18 @@ sys.path.insert(0, str(HERE.parent))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import base, sign, train  # noqa: E402
+from app import base, sign, train, trees  # noqa: E402
 from app.main import Cloud, Settings, create_app  # noqa: E402
 
-BASE = HERE.parent / "data" / "base.tsv.gz"
+BASE = HERE.parent / "data" / "base.tsv.gz"          # scheme 1's (the logistic trainer's port test)
+FIX = HERE / "fixtures"                               # scheme 2's: a fifth of the base's packs (tools/builtin.py --small)
 PG = os.environ.get("TEST_DATABASE_URL", "")
+
+
+def small(s: Settings) -> Settings:
+    """The server on the small base (training takes 2-3 minutes instead of 8)."""
+    s.base_file, s.builtin_file, s.builtin_heldout = str(FIX / "base2-small.tsv.gz"), str(FIX / "builtin2-small.txt"), str(FIX / "builtin2-small-heldout.json")
+    return s
 
 
 def db(folder: str, name: str) -> str:
@@ -67,7 +74,7 @@ class Api(unittest.TestCase):
         if PG:
             empty_postgres()
         cls.key = sign.new_key()
-        s = Settings()
+        s = small(Settings())
         s.database_url = db(cls.tmp.name, "test.db")
         s.admin_token = "secret"
         s.signing_key = sign.key_text(cls.key)
@@ -88,7 +95,8 @@ class Api(unittest.TestCase):
 
     @staticmethod
     def answer(h, kind="Kick", label=0, pack="0123456789abcdef"):
-        return {"hash": h, "pack": pack, "kind": kind, "fp": [0.5] * 64, "rows": [{"check": "loop", "label": label, "x": [0.1] * 7}]}
+        return {"hash": h, "pack": pack, "kind": kind, "fp": [0.5] * 64, "hint": [1, 0, 0, 0, 0, 5, 0, None],
+                "rows": [{"check": "loop", "label": label, "x": [0.1] * 7}]}
 
     def test_health(self):
         h = self.client.get("/health").json()
@@ -112,7 +120,7 @@ class Api(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/public-key").json()["key"], sign.public_text(self.key))
 
     def test_a_server_without_a_key_makes_one_and_keeps_it(self):
-        s = Settings()
+        s = small(Settings())
         s.database_url = db(self.tmp.name, "keys.db")
         s.signing_key = ""
         first = Cloud(s)
@@ -124,7 +132,7 @@ class Api(unittest.TestCase):
 
     def test_on_railway_it_wont_start_without_postgres(self):
         for url in ("", "sqlite:///" + os.path.join(self.tmp.name, "lost.db")):
-            s = Settings()
+            s = small(Settings())
             s.hosted, s.database_url = True, url
             with self.assertRaises(RuntimeError, msg=url):
                 Cloud(s)
@@ -154,6 +162,8 @@ class Api(unittest.TestCase):
             "dims": ({"rows": [{"check": "loop", "label": 1, "x": [0.1] * 6}]}, 400),
             "label": ({"rows": [{"check": "loop", "label": 2, "x": [0.1] * 7}]}, 400),
             "huge": ({"rows": [{"check": "loop", "label": 1, "x": [1e9] * 7}]}, 400),
+            "hint": ({"hint": [1] * 9}, 400),
+            "hint nan": ({"hint": [float("nan")] * 8}, 400),
         }
         for what, (change, code) in cases.items():
             body = {"install": me, "app": "test", "scheme": self.cloud.scheme, "answers": [{**good, **change}]}
@@ -163,6 +173,7 @@ class Api(unittest.TestCase):
             raw = json.dumps(body).encode()  # (NaN too: httpx won't write it, a bad client could)
             self.assertEqual(self.client.post("/v1/answers", content=raw, headers={"content-type": "application/json"}).status_code, code, what)
         self.assertEqual(self.post(me, [good], scheme=self.cloud.scheme + 1).status_code, 409)
+        self.assertEqual(self.post(me, [{k: v for k, v in good.items() if k != "hint"}], scheme=1).status_code, 200)   # (older plugins: still learned from)
         self.assertEqual(self.post(me, [good] * 201).status_code, 400)
         big = self.client.post("/v1/answers", content=b"x" * 2_100_000, headers={"content-type": "application/json"})
         self.assertEqual(big.status_code, 413)
@@ -205,10 +216,14 @@ class Api(unittest.TestCase):
         self.cloud.limits.clear()
 
     def test_a_model_is_trained_signed_published_and_revoked(self):
+        """With no answers the candidate is the built-in model again (the same trainer, base and settings): it passes the gate."""
+        self.cloud.store._run("DELETE FROM answers")
         self.assertEqual(self.client.get(f"/v1/model?scheme={self.cloud.scheme}").json(), {"version": 0})
         t = self.client.post("/v1/admin/train", headers=self.admin).json()
         self.assertEqual(t["status"], "candidate", t)
         v = t["version"]
+        g = self.client.get(f"/v1/admin/models/{v}", headers=self.admin).json()
+        self.assertEqual(g["gate"]["heldout"], self.cloud.builtin_heldout)      # (the very same scores as the built-in's)
         # not published yet: the plugins still get "use your built-in"
         self.assertEqual(self.client.get(f"/v1/model?scheme={self.cloud.scheme}").json(), {"version": 0})
         self.assertEqual(self.client.post(f"/v1/admin/models/{v}/publish", headers=self.admin).json()["status"], "published")
@@ -217,24 +232,82 @@ class Api(unittest.TestCase):
         self.assertTrue(sign.verify(self.key.public_key(), v, self.cloud.scheme, m["text"], m["signature"]))
         self.assertFalse(sign.verify(self.key.public_key(), v, self.cloud.scheme, m["text"] + " ", m["signature"]))
         self.assertFalse(sign.verify(self.key.public_key(), v + 1, self.cloud.scheme, m["text"], m["signature"]))
-        self.assertEqual(set(train.read_model(m["text"])), set(train.read_model(self.cloud.builtin)))
+        got, built = trees.read(m["text"]), trees.read(self.cloud.builtin)
+        self.assertEqual(set(got), set(built))
+        for name, c in got.items():                                              # (the trees themselves, number for number)
+            self.assertEqual((c.dims, c.base, c.sure, len(c.trees)), (built[name].dims, built[name].base, built[name].sure, len(built[name].trees)), name)
+            self.assertTrue(all((a == b).all() for a, b in zip(c.trees, built[name].trees)), name)
+        self.assertIn(self.cloud.bars + "\n", m["text"])                       # (the decision's bars travel with it)
         self.assertEqual(self.client.get(f"/v1/model?scheme={self.cloud.scheme}&have={v}").json(), {"version": v, "same": True})
         self.assertEqual(self.client.get(f"/v1/model?scheme={self.cloud.scheme + 1}").json(), {"version": 0})
+        self.assertEqual(self.client.get("/v1/model?scheme=1").json(), {"version": 0})
         self.assertEqual(self.client.post(f"/v1/admin/models/{v}/revoke", headers=self.admin).json()["now"], 0)
         self.assertEqual(self.client.get(f"/v1/model?scheme={self.cloud.scheme}").json(), {"version": 0})
         self.assertEqual(self.client.get(f"/v1/admin/models/{v}", headers=self.admin).json()["status"], "revoked")
+        # AUTO_PUBLISH=1: a candidate that passes is published by itself
+        self.cloud.s.auto_publish = True
+        try:
+            t = self.cloud.train_now("test")
+        finally:
+            self.cloud.s.auto_publish = False
+        self.assertEqual(t["status"], "published", t)
+        self.assertEqual(self.client.get(f"/v1/model?scheme={self.cloud.scheme}").json()["version"], t["version"])
+        self.client.post(f"/v1/admin/models/{t['version']}/revoke", headers=self.admin)
+
+    def test_older_plugins_answers_are_learned_too(self):
+        """A scheme 1 answer's rows are scheme 2's own features: they join with the fingerprint and no hint (NaN)."""
+        h = "5" * 64
+        a = {k: v for k, v in self.answer(h, label=1).items() if k != "hint"}
+        self.assertEqual(self.post(str(uuid.uuid4()), [a], scheme=1).status_code, 200)
+        rows, _ = self.cloud.cloud_rows()
+        mine = [r for r in rows if r.path == h[:12]]
+        self.assertEqual(len(mine), 1)
+        x = mine[0].x
+        self.assertEqual(len(x), 7 + 64 + 8)
+        self.assertEqual(x[:7 + 64], [0.1] * 7 + [0.5] * 64)
+        self.assertTrue(all(v != v for v in x[-8:]))                            # (NaN: the trees go their learned way)
+        # a scheme 2 answer keeps its hint (null = NaN)
+        h2 = "6" * 64
+        self.assertEqual(self.post(str(uuid.uuid4()), [self.answer(h2, label=1)]).status_code, 200)
+        x2 = [r for r in self.cloud.cloud_rows()[0] if r.path == h2[:12]][0].x
+        self.assertEqual(x2[-8:-1], [1, 0, 0, 0, 0, 5, 0])
+        self.assertTrue(x2[-1] != x2[-1])
+        self.cloud.limits.clear()
+
+    def test_the_same_file_answered_alike_by_several(self):
+        """POST /v1/kinds: by the hash's first 4 hex digits; only files 3 plugins answered, all alike, never the SANDBOX's."""
+        three, two, split, box = "abc1" + "0" * 60, "abc1" + "1" * 60, "abc1" + "2" * 60, "abc1" + "3" * 60
+        for i in range(3):
+            self.post(str(uuid.uuid4()), [self.answer(three, "Snare"), self.answer(split, "Clap" if i == 0 else "Snare")])
+        for i in range(2):
+            self.post(str(uuid.uuid4()), [self.answer(two, "Kick")])
+        for i in range(3):
+            self.client.post("/v1/answers", json={"install": str(uuid.uuid4()), "app": "1.0 sandbox", "scheme": self.cloud.scheme, "answers": [self.answer(box, "Tom")]})
+        self.cloud.limits.clear()
+        got = self.client.post("/v1/kinds", json={"prefixes": ["abc1", "ffff"]}).json()["kinds"]
+        self.assertEqual(got, [{"hash": three, "kind": "Snare", "installs": 3}])
+        self.assertEqual(self.client.post("/v1/kinds", json={"prefixes": ["ffff"]}).json()["kinds"], [])
+        for bad in (["abc"], ["ABC1"], ["abc1x"], ["abc1"] * 501):
+            self.assertEqual(self.client.post("/v1/kinds", json={"prefixes": bad}).status_code, 400, bad[:1])
+        self.cloud.limits.clear()
 
     def test_the_gate_stops_bad_answers(self):
         """Many people "answer" snares as claps and claps as snares (copies of the base's own sounds): never published."""
         rows = [r for r in self.cloud.base if r.check == "pair:Snare|Clap"]
         people = [str(uuid.uuid4()) for _ in range(3)]
+        own = self.cloud.dims["pair:Snare|Clap"]
         for start in range(0, len(rows), 200):
-            batch = [{"hash": f"{i:064x}", "pack": r.pack, "kind": "Clap" if r.label else "Snare", "fp": [0.5] * 64,
-                      "rows": [{"check": r.check, "label": 0 if r.label else 1, "x": r.x}]} for i, r in enumerate(rows[start:start + 200], start)]
+            batch = [{"hash": f"{i:064x}", "pack": r.pack, "kind": "Clap" if r.label else "Snare", "fp": [float(v) for v in r.x[own:own + 64]],
+                      "hint": [None if v != v else float(v) for v in r.x[own + 64:]],
+                      "rows": [{"check": r.check, "label": 0 if r.label else 1, "x": [float(v) for v in r.x[:own]]}]} for i, r in enumerate(rows[start:start + 200], start)]
             for p in people:
                 self.cloud.limits.clear()
                 self.assertEqual(self.post(p, batch).status_code, 200)
-        t = self.cloud.train_now("test")
+        self.cloud.s.auto_publish = True                                         # (even then: the gate keeps it out)
+        try:
+            t = self.cloud.train_now("test")
+        finally:
+            self.cloud.s.auto_publish = False
         self.assertEqual(t["status"], "rejected", t)
         self.assertTrue(any(w.startswith("pair:Snare|Clap") for w in t["gate"]["why"]), t)
         v = t["version"]

@@ -1,0 +1,86 @@
+{
+ "loop": {
+  "bar": 0.995,
+  "decided": 9316,
+  "rows": 14418,
+  "wrong": 17
+ },
+ "loopkind": {
+  "bar": 0.999,
+  "decided": 2575,
+  "rows": 3759,
+  "wrong": 7
+ },
+ "note": {
+  "bar": 0.9995,
+  "decided": 4060,
+  "rows": 6920,
+  "wrong": 9
+ },
+ "pair:Clap|Snap": {
+  "bar": 0.9999,
+  "decided": 26,
+  "rows": 614,
+  "wrong": 0
+ },
+ "pair:FxAtmos|Fx": {
+  "bar": 1.01,
+  "decided": 0,
+  "rows": 703,
+  "wrong": 0
+ },
+ "pair:FxImpact|Fx": {
+  "bar": 1.01,
+  "decided": 0,
+  "rows": 542,
+  "wrong": 0
+ },
+ "pair:FxRiser|Fx": {
+  "bar": 1.01,
+  "decided": 0,
+  "rows": 624,
+  "wrong": 0
+ },
+ "pair:Hat|Cymbal": {
+  "bar": 0.999,
+  "decided": 914,
+  "rows": 1486,
+  "wrong": 2
+ },
+ "pair:Hat|OpenHat": {
+  "bar": 0.9999,
+  "decided": 20,
+  "rows": 1446,
+  "wrong": 0
+ },
+ "pair:Kick|Bass808": {
+  "bar": 1.01,
+  "decided": 0,
+  "rows": 1950,
+  "wrong": 0
+ },
+ "pair:OpenHat|Cymbal": {
+  "bar": 0.999,
+  "decided": 64,
+  "rows": 608,
+  "wrong": 0
+ },
+ "pair:Perc|Tom": {
+  "bar": 0.9999,
+  "decided": 44,
+  "rows": 1652,
+  "wrong": 0
+ },
+ "pair:Snare|Clap": {
+  "bar": 0.999,
+  "decided": 742,
+  "rows": 2307,
+  "wrong": 2
+ },
+ "pair:Snare|Rim": {
+  "bar": 0.999,
+  "decided": 1062,
+  "rows": 1923,
+  "wrong": 3
+ }
+}

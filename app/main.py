@@ -3,6 +3,8 @@ plugins get the improved checks back, signed. See README.md.
 
     POST   /v1/answers               a plugin's answers (batched; kind null = taken back)
     GET    /v1/model?have=&scheme=   the newest published model for these features (version 0 = use the built-in)
+    POST   /v1/kinds                 what several people answered for the very same files (by the first 4 hex digits of
+                                     their hashes only: the server never learns which file a plugin has)
     DELETE /v1/installs/{id}         forget everything a plugin shared
     GET    /v1/public-key            the key the plugin checks models with
     GET    /health
@@ -33,7 +35,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from . import base, sign, train
+from . import base, sign, train, trees
 from .store import Store
 
 HERE = Path(__file__).resolve().parent.parent
@@ -50,9 +52,12 @@ class Settings:
         self.signing_key = env("MODEL_SIGNING_KEY")
         self.auto_publish = env("AUTO_PUBLISH", "0") == "1"
         self.train_hour = int(env("TRAIN_HOUR_UTC", "3"))
-        self.base_file = env("BASE_FILE", str(HERE / "data" / "base.tsv.gz"))
-        self.builtin_file = env("BUILTIN_FILE", str(HERE / "data" / "builtin.txt"))
+        # scheme 2 (the app's SortFeatures.Scheme): the base, the app's built-in model and its held-out score on the base
+        self.base_file = env("BASE_FILE", str(HERE / "data" / "base2.tsv.gz"))
+        self.builtin_file = env("BUILTIN_FILE", str(HERE / "data" / "builtin2.txt"))
+        self.builtin_heldout = env("BUILTIN_HELDOUT", str(HERE / "data" / "builtin2-heldout.json"))
         self.max_per_install = int(env("MAX_PER_INSTALL", "5000"))
+        self.consensus = int(env("CONSENSUS_MIN", "3"))
         self.hosted = any(env(n) for n in ("RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT_ID", "RAILWAY_ENVIRONMENT"))
 
 
@@ -61,8 +66,10 @@ KINDS = {"Kick", "Bass808", "Snare", "Clap", "Snap", "Rim", "Hat", "OpenHat", "C
          "LoopPerc", "LoopHat", "LoopMelodic", "LoopGuitar", "LoopBass", "LoopVinyl", "Stem", "Chord", "Pad", "Bass", "Guitar",
          "OneShot", "Vox", "VocalPhrase", "FxRiser", "FxImpact", "FxAtmos", "Fx", "Midi", "Inspiration"}
 FP_COLUMNS = 64  # Fingerprint.Columns
-MAX_ANSWERS, MAX_ROWS, MAX_BODY = 200, 20, 2_000_000
-HEX64, HEX16 = re.compile(r"^[0-9a-f]{64}$"), re.compile(r"^[0-9a-f]{16}$")
+SCHEME = 2       # what this server trains; it takes scheme 1's answers too (their rows are scheme 2's own features)
+ACCEPTS = (1, 2)
+MAX_ANSWERS, MAX_ROWS, MAX_BODY, MAX_PREFIXES = 200, 20, 2_000_000, 500
+HEX64, HEX16, HEX4 = re.compile(r"^[0-9a-f]{64}$"), re.compile(r"^[0-9a-f]{16}$"), re.compile(r"^[0-9a-f]{4}$")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -77,6 +84,7 @@ class AnswerIn(BaseModel):
     pack: str = ""
     kind: str | None = None
     fp: list[float] = []
+    hint: list[float | None] = []   # scheme 2: what the name suggested (Sorter.Hint; null = nothing to go by), never the name
     rows: list[RowIn] = []
 
 
@@ -85,6 +93,10 @@ class BatchIn(BaseModel):
     app: str = ""
     scheme: int
     answers: list[AnswerIn]
+
+
+class KindsIn(BaseModel):
+    prefixes: list[str]
 
 
 class Cloud:
@@ -99,11 +111,17 @@ class Cloud:
                                "DATABASE_URL = ${{Postgres.DATABASE_URL}} (Add Reference), then deploy")
         self.started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.store = Store(self.s.database_url or None)
-        self.scheme, self.base = base.load(self.s.base_file)
+        self.scheme, self.base = base.load(self.s.base_file, arrays=True)
+        if self.scheme != SCHEME:
+            raise RuntimeError(f"{self.s.base_file} is scheme {self.scheme}: this server trains scheme {SCHEME} (--lab-strongbase)")
+        # each check's own features (a row: own ++ fingerprint ++ name hint): what a shared answer's rows carry
         self.dims: dict[str, int] = {}
         for r in self.base:
-            self.dims.setdefault(r.check, len(r.x))
+            self.dims.setdefault(r.check, len(r.x) - trees.FP - trees.HINT)
         self.builtin = Path(self.s.builtin_file).read_text(encoding="utf-8") if Path(self.s.builtin_file).exists() else ""
+        self.builtin_heldout = json.loads(Path(self.s.builtin_heldout).read_text(encoding="utf-8")) if Path(self.s.builtin_heldout).exists() else {}
+        # the decision's bars every model carries (the built-in's: the app was measured with them)
+        self.bars = next((line for line in self.builtin.split("\n") if line.startswith("bars ")), trees.BARS)
         # the signing key: MODEL_SIGNING_KEY if set, else the one this server made itself the first time (kept in the
         # database, so nobody has to handle it; its public half: GET /v1/public-key, built into the plugin)
         if self.s.signing_key:
@@ -139,8 +157,8 @@ class Cloud:
     def check_batch(self, b: BatchIn) -> list[dict]:
         if not UUID.match(b.install):
             raise HTTPException(400, "install: a random UUID, lower case")
-        if b.scheme != self.scheme:
-            raise HTTPException(409, f"features scheme {b.scheme} is not this server's ({self.scheme}): keep them for a newer one")
+        if b.scheme not in ACCEPTS:
+            raise HTTPException(409, f"features scheme {b.scheme} is not one this server takes ({ACCEPTS}): keep them for a newer one")
         if len(b.app) > 32 or len(b.answers) > MAX_ANSWERS:
             raise HTTPException(400, f"at most {MAX_ANSWERS} answers at a time")
         out = []
@@ -156,6 +174,8 @@ class Cloud:
                 raise HTTPException(400, "pack: 16 hex digits")
             if len(a.fp) != FP_COLUMNS or not _finite(a.fp):
                 raise HTTPException(400, f"fp: {FP_COLUMNS} finite numbers")
+            if b.scheme >= 2 and a.hint and (len(a.hint) != trees.HINT or not _finite([v for v in a.hint if v is not None])):
+                raise HTTPException(400, f"hint: {trees.HINT} numbers (null = missing)")
             if len(a.rows) > MAX_ROWS:
                 raise HTTPException(400, f"at most {MAX_ROWS} rows per answer")
             rows = []
@@ -163,27 +183,33 @@ class Cloud:
                 if r.check not in self.dims or len(r.x) != self.dims[r.check] or r.label not in (0, 1) or not _finite(r.x):
                     raise HTTPException(400, f"row {r.check!r}: unknown check, or not {self.dims.get(r.check, '?')} finite numbers")
                 rows.append({"check": r.check, "label": r.label, "x": r.x})
-            out.append({"hash": a.hash, "kind": a.kind, "pack": a.pack, "fp": a.fp, "rows": rows})
+            out.append({"hash": a.hash, "kind": a.kind, "pack": a.pack, "fp": a.fp, "hint": list(a.hint) if b.scheme >= 2 else [], "rows": rows})
         return out
 
     # ------------------------------------------------------------ training
 
     def cloud_rows(self) -> tuple[list[train.Row], dict]:
         """
-        The shared answers as rows: one per sound and check. Several people who answered the same file count as one
-        (its file hash); if they disagree, it isn't used. At most MAX_PER_INSTALL answers of each plugin (its newest).
+        The shared answers as scheme 2 rows: one per sound and check, its features = the row's own ++ the answer's
+        fingerprint ++ its name hint (missing: scheme 1's answers, or nothing to go by = NaN). Several people who answered
+        the same file count as one (its file hash); if they disagree, it isn't used. At most MAX_PER_INSTALL answers of
+        each plugin (its newest). Never the SANDBOX's.
         """
         per_install: dict[str, int] = {}
         votes: dict[tuple[str, str], dict] = {}
         installs = set()
-        for install, h, kind, pack, rows, received in self.store.answers(self.scheme, sandbox=False):
+        nan = float("nan")
+        for install, h, pack, scheme, fp, hint, rows in self.store.training_answers(ACCEPTS):
             n = per_install.get(install, 0)
             if n >= self.s.max_per_install:
                 continue
             per_install[install] = n + 1
             installs.add(install)
+            h8 = [nan if v is None else float(v) for v in hint] if hint and len(hint) == trees.HINT else [nan] * trees.HINT
             for r in rows:
-                v = votes.setdefault((h, r["check"]), {"labels": {}, "x": r["x"], "pack": pack})
+                if r["check"] not in self.dims or len(r["x"]) != self.dims[r["check"]] or len(fp) != FP_COLUMNS:
+                    continue
+                v = votes.setdefault((h, r["check"]), {"labels": {}, "x": r["x"] + fp + h8, "pack": pack})
                 v["labels"][install] = bool(r["label"])
         out, disagreed = [], 0
         for (h, check), v in votes.items():
@@ -194,9 +220,10 @@ class Cloud:
             out.append(train.Row(check=check, pack=v["pack"], label=labels.pop(), x=v["x"], source="shared", path=h[:12]))
         return out, {"installs": len(installs), "sounds": len({h for h, _ in votes}), "rows": len(out), "disagreed": disagreed}
 
-    def current_checks(self) -> dict[str, train.Check]:
+    def current_heldout(self) -> dict:
+        """What the model in use scored on the base, held out (the newest published one's, else the built-in's)."""
         m = self.store.published(self.scheme)
-        return train.read_model(m["text"] if m else self.builtin)
+        return m["gate"].get("heldout", {}) if m else self.builtin_heldout
 
     def train_now(self, why: str) -> dict:
         """A candidate: trained on the base + the shared answers, checked by the gate, published only if allowed."""
@@ -210,12 +237,13 @@ class Cloud:
             about = (f"cloud model {version}: trained {when} UTC on {len(self.base)} base examples + {info['rows']} shared "
                      f"({info['sounds']} sounds from {info['installs']} plugins), scheme {self.scheme}")
             report: list[str] = [f"{about} ({why})"]
-            text, checks = train.train_model(self.base + shared, about, report)
-            g = train.gate(checks, self.current_checks(), self.base)
-            report.append("== the gate: on the base examples, never more wrong decisions than the model in use")
+            text, checks, heldout = trees.train_model(self.base + shared, about, report, self.bars)
+            g = trees.gate(heldout, self.current_heldout())
+            report.append("== the gate: on the base's examples held out (packs it never heard), never more wrong decisions than the model in use")
             for name, c in g.checks.items():
-                report.append(f"   {name:<22} now {c['current']['decided']:5} decided, {c['current']['wrong']:3} wrong | "
-                              f"new {c['candidate']['decided']:5} decided, {c['candidate']['wrong']:3} wrong")
+                now, new = c["current"] or {}, c["candidate"] or {}
+                report.append(f"   {name:<22} now {now.get('decided', 0):5} decided, {now.get('wrong', 0):3} wrong | "
+                              f"new {new.get('decided', 0):5} decided, {new.get('wrong', 0):3} wrong")
             report.extend("   NO: " + w for w in g.why)
             status = "candidate" if g.passed else "rejected"
             signature = sign.sign(self.key, version, self.scheme, text) if self.key else ""
@@ -223,20 +251,31 @@ class Cloud:
                 status = "published"
             self.store.add_model({"version": version, "scheme": self.scheme, "created": int(time.time()), "status": status,
                                   "text": text, "signature": signature, "report": "\n".join(report),
-                                  "gate": json.dumps({"passed": g.passed, "why": g.why, "checks": g.checks}),
+                                  "gate": json.dumps({"passed": g.passed, "why": g.why, "checks": g.checks, "heldout": heldout}),
                                   "answers": info["rows"]})
             self.store.set("trained_at", str(int(time.time())))
-            self.store.set("trained_upto", str(self.store.newest_answer(self.scheme)))
+            self.store.set("trained_upto", str(self.store.newest_answer(ACCEPTS)))
             print(f"trained model {version} ({why}): {status}, {time.time() - t0:.1f} s", flush=True)
             return {"version": version, "status": status, "gate": {"passed": g.passed, "why": g.why}, "seconds": round(time.time() - t0, 1)}
         finally:
             self.training.release()
 
+    def kinds(self, prefixes: list[str]) -> list[dict]:
+        """
+        The files under these hash prefixes that at least CONSENSUS_MIN plugins answered, all alike (one that disagrees
+        and the file isn't given): their full hash, the kind, how many said it. The plugin compares the full hashes itself.
+        """
+        said: dict[str, list[tuple[str, int]]] = {}
+        for h, kind, n in self.store.kinds_of(prefixes):
+            said.setdefault(h, []).append((kind, n))
+        return [{"hash": h, "kind": k[0][0], "installs": k[0][1]} for h, k in sorted(said.items())
+                if len(k) == 1 and k[0][1] >= self.s.consensus]
+
     def due(self) -> bool:
         """Something new to learn from, and not trained in the last 20 hours."""
         last = int(self.store.get("trained_at", "0"))
         upto = int(self.store.get("trained_upto", "0"))
-        return time.time() - last > 20 * 3600 and self.store.newest_answer(self.scheme) > upto
+        return time.time() - last > 20 * 3600 and self.store.newest_answer(ACCEPTS) > upto
 
 
 def _finite(v: list[float]) -> bool:
@@ -316,6 +355,15 @@ def create_app(cloud: Cloud | None = None, nightly: bool = True) -> FastAPI:
         if m["version"] == have:
             return {"version": have, "same": True}
         return {"version": m["version"], "scheme": m["scheme"], "text": m["text"], "signature": m["signature"]}
+
+    @app.post("/v1/kinds")
+    def kinds(q: KindsIn, request: Request) -> dict:
+        c = the()
+        if not c.allow("ip:" + ip(request), 30):
+            raise HTTPException(429, "too many: try again in a minute")
+        if len(q.prefixes) > MAX_PREFIXES or not all(HEX4.match(p) for p in q.prefixes):
+            raise HTTPException(400, f"prefixes: at most {MAX_PREFIXES}, each the first 4 hex digits of a file's SHA-256")
+        return {"kinds": c.kinds(sorted(set(q.prefixes)))}
 
     @app.delete("/v1/installs/{install}")
     def forget(install: str, request: Request) -> dict:

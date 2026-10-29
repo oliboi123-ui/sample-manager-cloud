@@ -3,7 +3,8 @@
 
     installs  one row per plugin that shares (a random id it made itself; nothing else about it)
     answers   its latest answer per sound: the sound's file hash, the kind, its pack (a hash), the scheme of the
-              features, the measurements (fp) and the rows the app made of it (each check's label + features, JSON)
+              features, the measurements (fp), the name hint (scheme 2: what the name suggested, never the name) and
+              the rows the app made of it (each check's label + features, JSON)
     models    every model trained: candidate / rejected / published / revoked, its text, signature, report, gate
     state     small things to remember (when it last trained)
 """
@@ -23,6 +24,8 @@ SCHEMA = [
     "text TEXT NOT NULL, signature TEXT NOT NULL, report TEXT NOT NULL, gate TEXT NOT NULL, answers INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 ]
+# columns added later (a database made before them gets them at the next start; old answers keep "" = none)
+COLUMNS = [("answers", "hint", "TEXT NOT NULL DEFAULT ''")]
 
 
 class Store:
@@ -34,6 +37,11 @@ class Store:
         self._connect()
         for sql in SCHEMA:
             self._run(sql)
+        for table, column, kind in COLUMNS:
+            if self.pg:
+                self._run(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {kind}")
+            elif column not in [r[1] for r in self._run(f"PRAGMA table_info({table})", fetch=True)]:
+                self._run(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     # ------------------------------------------------------------ plumbing
 
@@ -103,10 +111,11 @@ class Store:
                 st.append(("DELETE FROM answers WHERE install = ? AND hash = ?", (install, a["hash"])))
             else:
                 st.append((
-                    "INSERT INTO answers (install, hash, kind, pack, scheme, fp, rows, app, received) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO answers (install, hash, kind, pack, scheme, fp, hint, rows, app, received) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (install, hash) DO UPDATE SET kind = excluded.kind, pack = excluded.pack, scheme = excluded.scheme, "
-                    "fp = excluded.fp, rows = excluded.rows, app = excluded.app, received = excluded.received",
+                    "fp = excluded.fp, hint = excluded.hint, rows = excluded.rows, app = excluded.app, received = excluded.received",
                     (install, a["hash"], a["kind"], a["pack"], scheme, json.dumps(a["fp"], separators=(",", ":")),
+                     json.dumps(a["hint"], separators=(",", ":")) if a.get("hint") else "",
                      json.dumps(a["rows"], separators=(",", ":")), app, now)))
         self._many(st)
         return len(answers)
@@ -125,8 +134,26 @@ class Store:
                         args, fetch=True)
         return [(r[0], r[1], r[2], r[3], json.loads(r[4]), int(r[5])) for r in got]
 
-    def newest_answer(self, scheme: int) -> int:
-        got = self._run("SELECT MAX(received) FROM answers WHERE scheme = ?", (scheme,), fetch=True)
+    def training_answers(self, schemes: tuple[int, ...]) -> list[tuple[str, str, str, int, list[float], list | None, list[dict]]]:
+        """(install, hash, pack, scheme, fp, hint or None, rows) of every answer the training may learn from: these schemes,
+        never the SANDBOX's (its app ends in "sandbox"), newest first."""
+        marks = ", ".join("?" for _ in schemes)
+        got = self._run(f"SELECT install, hash, pack, scheme, fp, hint, rows FROM answers WHERE scheme IN ({marks}) AND app NOT LIKE ? "
+                        "ORDER BY received DESC", (*schemes, "%sandbox"), fetch=True)
+        return [(r[0], r[1], r[2], int(r[3]), json.loads(r[4]), json.loads(r[5]) if r[5] else None, json.loads(r[6])) for r in got]
+
+    def kinds_of(self, prefixes: list[str]) -> list[tuple[str, str, int]]:
+        """(hash, kind, how many installs said it) for the files whose hash starts with one of these (the SANDBOX's left out)."""
+        if not prefixes:
+            return []
+        marks = ", ".join("?" for _ in prefixes)
+        got = self._run(f"SELECT hash, kind, COUNT(DISTINCT install) FROM answers WHERE substr(hash, 1, 4) IN ({marks}) AND app NOT LIKE ? "
+                        "GROUP BY hash, kind", (*prefixes, "%sandbox"), fetch=True)
+        return [(r[0], r[1], int(r[2])) for r in got]
+
+    def newest_answer(self, schemes: tuple[int, ...]) -> int:
+        marks = ", ".join("?" for _ in schemes)
+        got = self._run(f"SELECT MAX(received) FROM answers WHERE scheme IN ({marks})", schemes, fetch=True)
         return int(got[0][0] or 0)
 
     def stats(self) -> dict:
