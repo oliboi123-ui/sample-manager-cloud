@@ -1,4 +1,6 @@
-"""The cloud, tested on this PC (SQLite, no network):   python -m unittest discover -s tests -v   (from cloud/)"""
+"""The cloud, tested on this PC (SQLite, no network):   python -m unittest discover -s tests -v   (from cloud/)
+On Postgres too (as on Railway): TEST_DATABASE_URL = a throwaway database on this PC (its tables are emptied first):
+    python tests/on_postgres.py   (starts one of its own: pip install pgserver)"""
 from __future__ import annotations
 
 import json
@@ -18,6 +20,24 @@ from app import base, sign, train  # noqa: E402
 from app.main import Cloud, Settings, create_app  # noqa: E402
 
 BASE = HERE.parent / "data" / "base.tsv.gz"
+PG = os.environ.get("TEST_DATABASE_URL", "")
+
+
+def db(folder: str, name: str) -> str:
+    """Where a test keeps its data: SQLite in a folder of its own, or the throwaway Postgres."""
+    return PG or "sqlite:///" + os.path.join(folder, name)
+
+
+def empty_postgres() -> None:
+    """Only a database on this PC (never a real one): every table of the cloud dropped."""
+    import psycopg
+    from urllib.parse import urlparse
+    host = urlparse(PG).hostname or ""
+    if host not in ("", "localhost", "127.0.0.1", "::1"):
+        raise SystemExit(f"TEST_DATABASE_URL must be a throwaway database on this PC, not {host}")
+    with psycopg.connect(PG, autocommit=True) as c:
+        for t in ("answers", "installs", "models", "state"):
+            c.execute(f"DROP TABLE IF EXISTS {t}")
 
 
 class TrainerMatchesTheApp(unittest.TestCase):
@@ -44,9 +64,11 @@ class Api(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
+        if PG:
+            empty_postgres()
         cls.key = sign.new_key()
         s = Settings()
-        s.database_url = "sqlite:///" + os.path.join(cls.tmp.name, "test.db")
+        s.database_url = db(cls.tmp.name, "test.db")
         s.admin_token = "secret"
         s.signing_key = sign.key_text(cls.key)
         s.auto_publish = False
@@ -70,14 +92,28 @@ class Api(unittest.TestCase):
 
     def test_health(self):
         h = self.client.get("/health").json()
-        self.assertEqual((h["ok"], h["store"]), (True, "sqlite"))
+        self.assertEqual((h["ok"], h["store"]), (True, "postgres" if PG else "sqlite"))
+
+    @unittest.skipUnless(PG, "Postgres only (TEST_DATABASE_URL)")
+    def test_a_database_restart_doesnt_stop_the_answers(self):
+        """Railway restarts the database now and then: the server's connection is gone, the next request makes a new one."""
+        import psycopg
+        for what in ("answers", "model"):
+            with psycopg.connect(PG, autocommit=True) as c:
+                c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database()")
+            if what == "answers":
+                r = self.post(str(uuid.uuid4()), [self.answer("9" * 64)])
+            else:
+                r = self.client.get(f"/v1/model?scheme={self.cloud.scheme}")
+            self.assertEqual(r.status_code, 200, what)
+        self.cloud.limits.clear()
 
     def test_public_key(self):
         self.assertEqual(self.client.get("/v1/public-key").json()["key"], sign.public_text(self.key))
 
     def test_a_server_without_a_key_makes_one_and_keeps_it(self):
         s = Settings()
-        s.database_url = "sqlite:///" + os.path.join(self.tmp.name, "keys.db")
+        s.database_url = db(self.tmp.name, "keys.db")
         s.signing_key = ""
         first = Cloud(s)
         key = sign.public_text(first.key)

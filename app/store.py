@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 SCHEMA = [
     "CREATE TABLE IF NOT EXISTS installs (id TEXT PRIMARY KEY, first_seen BIGINT NOT NULL, last_seen BIGINT NOT NULL, app TEXT NOT NULL)",
@@ -49,39 +49,46 @@ class Store:
     def _sql(self, sql: str) -> str:
         return sql.replace("?", "%s") if self.pg else sql
 
-    def _run(self, sql: str, args: Iterable[Any] = (), fetch: bool = False) -> list[tuple]:
-        """One statement (a broken Postgres connection is made again once: Railway restarts the database now and then)."""
+    def _with_conn(self, work: Callable[[Any], Any]) -> Any:
+        """work(connection), once more on a new connection if Postgres dropped it (Railway restarts the database now and
+        then; a transaction cut off that way was rolled back, so doing it again is safe)."""
         with self.lock:
             for attempt in (1, 2):
                 try:
-                    cur = self.conn.execute(self._sql(sql), tuple(args))
-                    return list(cur.fetchall()) if fetch else []
+                    return work(self.conn)
                 except Exception as e:
-                    if not self.pg or attempt == 2 or not _broken(e):
+                    if not self.pg or attempt == 2 or not (_broken(e) or getattr(self.conn, "broken", False) or getattr(self.conn, "closed", False)):
                         raise
                     try:
                         self.conn.close()
                     except Exception:
                         pass
                     self._connect()
-        return []
+
+    def _run(self, sql: str, args: Iterable[Any] = (), fetch: bool = False) -> list[tuple]:
+        """One statement."""
+        def work(conn: Any) -> list[tuple]:
+            cur = conn.execute(self._sql(sql), tuple(args))
+            return list(cur.fetchall()) if fetch else []
+        return self._with_conn(work)
 
     def _many(self, statements: list[tuple[str, tuple]]) -> None:
         """Several statements as one transaction."""
-        with self.lock:
+        def work(conn: Any) -> None:
             if self.pg:
-                with self.conn.transaction():
+                with conn.transaction():
                     for sql, args in statements:
-                        self.conn.execute(self._sql(sql), args)
+                        conn.execute(self._sql(sql), args)
             else:
-                self.conn.execute("BEGIN")
+                conn.execute("BEGIN")
                 try:
                     for sql, args in statements:
-                        self.conn.execute(sql, args)
-                    self.conn.execute("COMMIT")
+                        conn.execute(sql, args)
+                    conn.execute("COMMIT")
                 except Exception:
-                    self.conn.execute("ROLLBACK")
+                    conn.execute("ROLLBACK")
                     raise
+        self._with_conn(work)
 
     # ------------------------------------------------------------ answers
 
@@ -169,5 +176,11 @@ def _model(r: tuple) -> dict:
 
 
 def _broken(e: Exception) -> bool:
-    name = type(e).__name__
-    return name in ("OperationalError", "InterfaceError") or "closed" in str(e).lower()
+    """The connection is gone (psycopg: OperationalError and its kinds, e.g. AdminShutdown; InterfaceError)."""
+    try:
+        import psycopg
+        if isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError)):
+            return True
+    except ImportError:
+        pass
+    return "closed" in str(e).lower()
