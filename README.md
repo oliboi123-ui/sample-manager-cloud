@@ -46,7 +46,11 @@ Python 3.12, FastAPI, Postgres on Railway (SQLite on a PC for tests). One proces
 3. In the service's **Variables**: `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`, `ADMIN_TOKEN` = a long random
    string (PowerShell: `[guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')`), `AUTO_PUBLISH` = `0`.
 4. **Settings → Networking → Generate Domain**: the address, e.g. `https://sample-manager-cloud.up.railway.app`.
-   `<address>/health` should say `{"ok":true,"scheme":1,"store":"postgres"}` (`sqlite` = DATABASE_URL is missing: the data and the signing key would be lost at every redeploy).
+   `<address>/health` should say `{"ok":true,"scheme":1,"store":"postgres","since":"<when this deploy started>"}`.
+   On Railway the service won't start without Postgres (a SQLite file, its answers and its signing key would be lost at
+   every redeploy): the deploy fails with "DATABASE_URL is missing…" in its log and the one before keeps running. If the
+   database service isn't called `Postgres`, `${{Postgres.DATABASE_URL}}` is empty: pick it with **Add Reference**.
+   Railway holds variable changes as *staged changes* until you press **Deploy**.
 5. Give the address to whoever builds the plugin: it goes into `src\config.default.json` (`Cloud.Url`) with the key
    from `<address>/v1/public-key` (`Cloud.PublicKey`). Until then the plugin never asks to share and never connects.
 

@@ -86,6 +86,14 @@ class Api(unittest.TestCase):
         self.assertEqual(sign.public_text(again.key), key)
         again.store.conn.close()
 
+    def test_on_railway_it_wont_start_without_postgres(self):
+        for url in ("", "sqlite:///" + os.path.join(self.tmp.name, "lost.db")):
+            s = Settings()
+            s.hosted, s.database_url = True, url
+            with self.assertRaises(RuntimeError, msg=url):
+                Cloud(s)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "lost.db")))
+
     def test_answers_kept_replaced_and_taken_back(self):
         me = str(uuid.uuid4())
         h1, h2 = "a" * 64, "b" * 64

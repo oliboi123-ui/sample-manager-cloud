@@ -53,6 +53,7 @@ class Settings:
         self.base_file = env("BASE_FILE", str(HERE / "data" / "base.tsv.gz"))
         self.builtin_file = env("BUILTIN_FILE", str(HERE / "data" / "builtin.txt"))
         self.max_per_install = int(env("MAX_PER_INSTALL", "5000"))
+        self.hosted = any(env(n) for n in ("RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT_ID", "RAILWAY_ENVIRONMENT"))
 
 
 # what the plugins may send (src/App/Cloud.cs; the kinds: src/Classifier.cs SType)
@@ -91,6 +92,12 @@ class Cloud:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.s = settings or Settings()
+        # on Railway a SQLite file is lost at every redeploy, and with it the signing key the plugins trust and every
+        # answer: refuse to start (the deploy fails, the one before keeps running) instead of starting over unnoticed
+        if self.s.hosted and not self.s.database_url.startswith("postgres"):
+            raise RuntimeError("DATABASE_URL is missing or not a Postgres address: in the service's Variables set "
+                               "DATABASE_URL = ${{Postgres.DATABASE_URL}} (Add Reference), then deploy")
+        self.started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.store = Store(self.s.database_url or None)
         self.scheme, self.base = base.load(self.s.base_file)
         self.dims: dict[str, int] = {}
@@ -281,8 +288,8 @@ def create_app(cloud: Cloud | None = None, nightly: bool = True) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        """Up, its features' scheme, and where it keeps its data (postgres; sqlite = a file that a redeploy loses)."""
-        return {"ok": True, "scheme": the().scheme, "store": "postgres" if the().store.pg else "sqlite"}
+        """Up, its features' scheme, where it keeps its data (postgres; sqlite = a file that a redeploy loses), since when."""
+        return {"ok": True, "scheme": the().scheme, "store": "postgres" if the().store.pg else "sqlite", "since": the().started}
 
     @app.get("/v1/public-key")
     def public_key() -> dict:
