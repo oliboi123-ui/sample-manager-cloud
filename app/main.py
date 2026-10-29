@@ -176,7 +176,7 @@ class Cloud:
         per_install: dict[str, int] = {}
         votes: dict[tuple[str, str], dict] = {}
         installs = set()
-        for install, h, kind, pack, rows, received in self.store.answers(self.scheme):
+        for install, h, kind, pack, rows, received in self.store.answers(self.scheme, sandbox=False):
             n = per_install.get(install, 0)
             if n >= self.s.max_per_install:
                 continue

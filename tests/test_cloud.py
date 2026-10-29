@@ -185,6 +185,16 @@ class Api(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/v1/installs/{me}").json(), {"deleted": 2})
         self.assertFalse([a for a in self.cloud.store.answers(self.cloud.scheme) if a[0] == me])
 
+    def test_the_sandbox_is_never_taught(self):
+        h = "7" * 64
+        r = self.client.post("/v1/answers", json={"install": str(uuid.uuid4()), "app": "1.0 sandbox", "scheme": self.cloud.scheme,
+                                                  "answers": [self.answer(h)]})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(h, [a[1] for a in self.cloud.store.answers(self.cloud.scheme)])
+        rows, _ = self.cloud.cloud_rows()
+        self.assertFalse([r for r in rows if r.path == h[:12]])
+        self.cloud.limits.clear()
+
     def test_people_who_disagree_dont_count(self):
         h = "1" * 64
         self.post(str(uuid.uuid4()), [self.answer(h, label=1)])

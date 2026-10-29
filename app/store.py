@@ -116,10 +116,13 @@ class Store:
         self._many([("DELETE FROM answers WHERE install = ?", (install,)), ("DELETE FROM installs WHERE id = ?", (install,))])
         return int(n)
 
-    def answers(self, scheme: int) -> list[tuple[str, str, str, str, list[dict], int]]:
-        """(install, hash, kind, pack, rows, received) of every answer with these features, newest first."""
-        got = self._run("SELECT install, hash, kind, pack, rows, received FROM answers WHERE scheme = ? ORDER BY received DESC",
-                        (scheme,), fetch=True)
+    def answers(self, scheme: int, sandbox: bool = True) -> list[tuple[str, str, str, str, list[dict], int]]:
+        """(install, hash, kind, pack, rows, received) of every answer with these features, newest first (sandbox=False:
+        not the SANDBOX's, its app ends in "sandbox": tests, never taught)."""
+        # (the pattern as an argument: in the SQL itself Postgres would read its % as a placeholder)
+        where, args = ("scheme = ?", (scheme,)) if sandbox else ("scheme = ? AND app NOT LIKE ?", (scheme, "%sandbox"))
+        got = self._run(f"SELECT install, hash, kind, pack, rows, received FROM answers WHERE {where} ORDER BY received DESC",
+                        args, fetch=True)
         return [(r[0], r[1], r[2], r[3], json.loads(r[4]), int(r[5])) for r in got]
 
     def newest_answer(self, scheme: int) -> int:
