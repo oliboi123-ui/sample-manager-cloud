@@ -2,6 +2,7 @@
 a deployment's log. Needs a Railway *project token* (project Settings -> Tokens) in ~/.railway-token; it is never printed.
     python tools/railway.py look
     python tools/railway.py logs <deployment id> [lines]
+    python tools/railway.py deploy [commit]     the newest commit by default; waits for it (pushing alone doesn't deploy)
     python tools/railway.py gql '<query>' ['<variables json>']     (careful: prints what it returns, secrets included)
 """
 import json
@@ -65,6 +66,27 @@ def look():
             print(f"  deploy {n['createdAt'][:19]}  {n['status']:<10} {n['id']}")
 
 
+def deploy(sha=None):
+    """Deploys a commit (the newest of this repo by default) and waits for it (a push alone doesn't: no GitHub trigger)."""
+    import subprocess
+    import time
+    ids = gql("query { projectToken { projectId environmentId } }")["projectToken"]
+    proj = gql("query($id: String!) { project(id: $id) { services { edges { node { id name } } } } }", {"id": ids["projectId"]})["project"]
+    service = next(x["node"]["id"] for x in proj["services"]["edges"] if x["node"]["name"] == "sample-manager-cloud")
+    sha = sha or subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)), text=True).strip()
+    dep = gql("mutation($e: String!, $s: String!, $c: String) { serviceInstanceDeployV2(environmentId: $e, serviceId: $s, commitSha: $c) }",
+              {"e": ids["environmentId"], "s": service, "c": sha})["serviceInstanceDeployV2"]
+    print(f"deploying {sha[:7]}: {dep}", flush=True)
+    for _ in range(90):
+        status = gql("query($d: String!) { deployment(id: $d) { status } }", {"d": dep})["deployment"]["status"]
+        if status in ("SUCCESS", "FAILED", "CRASHED", "REMOVED", "SKIPPED"):
+            break
+        time.sleep(10)
+    print(f"deploy {dep}: {status}")
+    if status != "SUCCESS":
+        raise SystemExit(f"see: python tools/railway.py logs {dep}")
+
+
 def logs(dep, n=60):
     out = gql("query($d: String!, $n: Int) { deploymentLogs(deploymentId: $d, limit: $n) { timestamp message } }", {"d": dep, "n": int(n)})
     for line in out["deploymentLogs"]:
@@ -77,5 +99,7 @@ if __name__ == "__main__":
         look()
     elif cmd == "logs":
         logs(*sys.argv[2:])
+    elif cmd == "deploy":
+        deploy(*sys.argv[2:])
     elif cmd == "gql":
         print(json.dumps(gql(sys.argv[2], json.loads(sys.argv[3]) if len(sys.argv) > 3 else None), indent=1))

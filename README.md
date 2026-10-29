@@ -54,10 +54,12 @@ Python 3.12, FastAPI, Postgres on Railway (SQLite on a PC for tests). One proces
 5. Give the address to whoever builds the plugin: it goes into `src\config.default.json` (`Cloud.Url`) with the key
    from `<address>/v1/public-key` (`Cloud.PublicKey`). Until then the plugin never asks to share and never connects.
 
-Every push to `main` deploys again. The service keeps its data in Postgres (answers, models, its signing key).
+The service keeps its data in Postgres (answers, models, its signing key). Pushing to `main` doesn't deploy by itself
+(the service has no GitHub trigger; to add one: the service's **Settings → Source**, branch `main`):
+`python tools/railway.py deploy` deploys the newest commit and waits for it.
 
 From a PC, `python tools/railway.py look` shows the services, which variables are set (secret values masked) and the
-recent deploys; `python tools/railway.py logs <deployment id>` a deploy's log. It needs a project token (project
+recent deploys; `python tools/railway.py logs <deployment id>` a deploy's log; `deploy` a commit. It needs a project token (project
 **Settings → Tokens**, for `production`) saved in `%USERPROFILE%\.railway-token`.
 
 ## The admin calls (PowerShell)
