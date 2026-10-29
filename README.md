@@ -83,7 +83,8 @@ recent deploys; `python tools/railway.py logs <deployment id>` a deploy's log; `
 ```powershell
 $cloud = "https://<address>"; $h = @{ Authorization = "Bearer <ADMIN_TOKEN>" }
 irm "$cloud/v1/admin/stats" -Headers $h                          # plugins, answers, sounds, the model in use
-irm "$cloud/v1/admin/train" -Method Post -Headers $h             # a candidate now (not only at night)
+irm "$cloud/v1/admin/train" -Method Post -Headers $h             # a candidate now (not only at night): on Railway the call
+                                                                 # ends 502 after 5 minutes (its proxy); the training goes on: see models
 irm "$cloud/v1/admin/models" -Headers $h                         # every model and its gate
 (irm "$cloud/v1/admin/models/3" -Headers $h).report              # one model's report: what it decides, the gate
 irm "$cloud/v1/admin/models/3/publish" -Method Post -Headers $h  # the plugins get it at their next daily check
