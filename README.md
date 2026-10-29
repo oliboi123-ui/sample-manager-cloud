@@ -98,3 +98,8 @@ trains from the same base (the test that the port trains the same).
   model from ever reaching anyone if it does worse on the base; answers about sounds the base doesn't cover can only
   move the checks a little, and every check still needs the name and the sound to agree before it files anything.
 * Sorting a download by what others answered for the very same file (its hash) is the next step.
+* **A stronger model (scheme 2).** `research/` (needs scikit-learn and the developer's test bench) shows that the
+  checks' limit is the model, not the number of answers: more honest answers make today's logistic checks decide
+  *less* of unseen downloads, while gradient-boosted trees on each check's features + the whole fingerprint decide 2–3×
+  as much at under 0.3% wrong, and only with the downloads' answers (on the library alone their bar doesn't carry over
+  to downloads). Every answer already carries the fingerprint, so what is shared now counts for it.
