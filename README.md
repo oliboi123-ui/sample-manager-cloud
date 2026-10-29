@@ -56,6 +56,10 @@ Python 3.12, FastAPI, Postgres on Railway (SQLite on a PC for tests). One proces
 
 Every push to `main` deploys again. The service keeps its data in Postgres (answers, models, its signing key).
 
+From a PC, `python tools/railway.py look` shows the services, which variables are set (secret values masked) and the
+recent deploys; `python tools/railway.py logs <deployment id>` a deploy's log. It needs a project token (project
+**Settings → Tokens**, for `production`) saved in `%USERPROFILE%\.railway-token`.
+
 ## The admin calls (PowerShell)
 
 ```powershell
