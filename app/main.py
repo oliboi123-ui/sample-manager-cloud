@@ -281,7 +281,8 @@ def create_app(cloud: Cloud | None = None, nightly: bool = True) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        return {"ok": True, "scheme": the().scheme}
+        """Up, its features' scheme, and where it keeps its data (postgres; sqlite = a file that a redeploy loses)."""
+        return {"ok": True, "scheme": the().scheme, "store": "postgres" if the().store.pg else "sqlite"}
 
     @app.get("/v1/public-key")
     def public_key() -> dict:

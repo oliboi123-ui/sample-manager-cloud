@@ -69,7 +69,8 @@ class Api(unittest.TestCase):
         return {"hash": h, "pack": pack, "kind": kind, "fp": [0.5] * 64, "rows": [{"check": "loop", "label": label, "x": [0.1] * 7}]}
 
     def test_health(self):
-        self.assertEqual(self.client.get("/health").json()["ok"], True)
+        h = self.client.get("/health").json()
+        self.assertEqual((h["ok"], h["store"]), (True, "sqlite"))
 
     def test_public_key(self):
         self.assertEqual(self.client.get("/v1/public-key").json()["key"], sign.public_text(self.key))
